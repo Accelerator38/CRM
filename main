@@ -1,0 +1,512 @@
+import os
+import logging.config
+import shelve
+import config
+
+from datetime import datetime
+from datetime import timedelta
+from loguru import logger
+
+import pandas as pd
+import numpy as np
+
+
+def get_info(injection, pressure, ml_wells):
+    info = {
+        'name': 'hybrid',
+        'version': '0.0.1',
+        'restart_date': datetime.strftime(injection.index[-1] + timedelta(1), '%Y-%m-%d'),
+        'prod_wells': {},
+        'inj_wells': {}
+    }
+    for (well_name, inj) in injection.items():
+        info['inj_wells'][well_name] = {'injection': inj[-1]}
+
+    for (well_name, press) in pressure.items():
+        info['prod_wells'][well_name] = {'pressure': press[-1]}
+
+    return info
+
+def change_cut_dates_nes(ind_left, ind_right):
+    '''
+    Меняет даты если, не входят в CONFIG
+    '''
+    global config
+    logger.info(str(ind_left) + str(ind_right))
+    if datetime.strptime(config.CUT_DATE, '%Y-%m-%d') < ind_left:
+        config.CUT_DATE = datetime.strftime(ind_left, '%Y-%m-%d')
+        logger.info('CUT_DATE changed')
+        print('CUT_DATE changed')
+
+    if datetime.strptime(config.CUT_DATE2, '%Y-%m-%d') > ind_right:
+        config.CUT_DATE2 = datetime.strftime(ind_right, '%Y-%m-%d')
+        logger.info('CUT_DATE2 changed')
+        print('CUT_DATE2 changed')
+
+coordinates = None
+production = None
+pressure = None
+pressure_reservoir = None
+injection = None
+water_cut = None
+gazfact = None
+
+
+def main():
+    # import prepare_feather_data
+    import config
+    from functools import reduce
+    from crm.preprocessing.utils import cut_inactive_wells
+    from crm.preprocessing.utils import select_wells_nearest_to_prod
+    from crm.preprocessing.utils import recover_pres
+    from crm.models.crm import CRM
+    from crm.models.crmip import CRMIP
+    from crm.optimization.minimizers import SciPySlsqpWrapper
+
+    from hybrid import Base_TSF_Model as TimeSeriesModel
+    from hybrid import prepare_injection as pdInj
+    from hybrid import utils
+
+
+    import plot
+
+
+    global coordinates, production, pressure, pressure_reservoir, injection, water_cut, gazfact
+
+    logger.add("log.log", rotation="500 MB")
+    logger.info('preset_choice ' + str(config.preset_choice))
+    logger.info('path_train ' + str(config.path_train))
+    logger.info('INFLUENCE_R ' + str(config.INFLUENCE_R))
+    logger.info('double_R ' + str(config.double_R))
+    logger.info('split_ratio ' + str(config.split_ratio))
+    logger.info('inactive_time ' + str(config.inactive_time))
+    logger.info('CUT_DATE ' + str(config.CUT_DATE))
+    logger.info('CUT_DATE2 ' + str(config.CUT_DATE2))
+    logger.info('p_res ' + str(config.p_res))
+    logger.info('p_0 ' + str(config.p_0))
+    logger.info('recov_time ' + str(config.recov_time))
+    logger.info('TAU_0 ' + str(config.TAU_0))
+    logger.info('J_0 ' + str(config.J_0))
+    logger.info('options_SLSQP_CRM ' + str(config.options_SLSQP_CRM))
+    logger.info('liquid_flag ' + str(config.liquid_flag))
+    logger.info('wc_flag ' + str(config.wc_flag))
+    logger.info('gaz_factor_flag ' + str(config.gaz_factor_flag))
+    logger.info('pressure_reservoir_flag ' + str(config.pressure_reservoir_flag))
+    logger.info('prod_bnd ' + str(config.prod_bnd))
+    logger.info('tau_bnd ' + str(config.tau_bnd))
+    logger.info('J_bnd ' + str(config.J_bnd))
+    logger.info('f_bnd ' + str(config.f_bnd))
+
+    config.bnds_CRM = {'prod_bnd': config.prod_bnd, 'tau_bnd': config.tau_bnd,
+                       'J_bnd': config.J_bnd, 'f_bnd': config.f_bnd}
+
+    config.test_period_len = ((1 - config.split_ratio) * (datetime.strptime(config.CUT_DATE2, '%Y-%m-%d') -
+                                            datetime.strptime(config.CUT_DATE, '%Y-%m-%d'))).days - 1
+    # Prepare data to CRM
+    # +++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+    xls = pd.ExcelFile(os.path.join(config.path_train, f'Data_{config.oilfield}.xlsx')) # данные с месторождения
+    # xls = pd.ExcelFile(
+    #     os.path.join(config.path_train, f'messo_ppd_optimization.xlsx'))  # данные с месторождения
+    if config.double_R == False:
+        coordinates = pd.read_excel(xls, sheet_name=2, dtype={'Скважина': str})
+        coordinates = coordinates[['Скважина', 'Координата X', 'Координата Y']]
+    else:
+        coordinates = pd.read_excel(xls, sheet_name=2, dtype={'Скважина': str})
+    coordinates['Скважина'] = coordinates['Скважина'].astype(str)
+    coordinates = coordinates.set_index('Скважина')
+
+    nef_info = pd.read_excel(xls, sheet_name=0, dtype={'Скважина': str})
+    production = pd.\
+        pivot_table(nef_info, values='Дебит жидкости', index='Дата', columns='Скважина', dropna=False).\
+        apply(lambda x: x.interpolate(limit_direction='forward', limit_area='inside'), axis=0)[config.CUT_DATE:config.CUT_DATE2].\
+        dropna(axis=1, how='all').fillna(0) # заполняет пропуски дат в данных дебитах жидкости
+    production.columns.name = None
+
+    water_cut = pd.\
+        pivot_table(nef_info, values='Обводненность', index='Дата', columns='Скважина', dropna=False).\
+        apply(lambda x: x.interpolate(limit_direction='forward', limit_area='inside'), axis=0)[config.CUT_DATE:config.CUT_DATE2].\
+        dropna(axis=1, how='all') # заполняет пропуски дат в данных обводненности
+    water_cut.columns.name = None
+
+    pressure = pd.\
+        pivot_table(nef_info, values='Забойное давление', index='Дата', columns='Скважина', dropna=False).\
+        apply(lambda x: x.interpolate(limit_direction='forward', limit_area='inside'), axis=0)[config.CUT_DATE:config.CUT_DATE2]. \
+        dropna(axis=1, how='all').fillna(0) # заполняет пропуски дат в данных забойного давления
+    pressure.columns.name = None
+
+
+    nag_info = pd.read_excel(xls, sheet_name=1, dtype={'Скважина': str})
+    injection = pd.\
+        pivot_table(nag_info, values='Приемистость', index='Дата', columns='Скважина', dropna=False).\
+        apply(lambda x: x.interpolate(limit_direction='forward', limit_area='inside'), axis=0)[config.CUT_DATE:config.CUT_DATE2]. \
+        dropna(axis=1, how='all').fillna(0) # заполняет пропуски дат в данных приемистости
+    injection.columns.name = None
+
+    production.columns = production.columns.astype(str)
+    pressure.columns = pressure.columns.astype(str)
+    water_cut.columns = water_cut.columns.astype(str)
+    injection.columns = injection.columns.astype(str)
+    # индекс в datetime переводит
+    production.index = pd.to_datetime(production.index)
+    pressure.index = pd.to_datetime(pressure.index)
+    water_cut.index = pd.to_datetime(water_cut.index)
+    injection.index = pd.to_datetime(injection.index)
+
+    # меняет граничные даты, если в config указаны даты не входящие в данные
+    list([change_cut_dates_nes(el.index[0], el.index[-1]) for el in (production, water_cut, pressure, injection)])
+    production = production.loc[config.CUT_DATE:config.CUT_DATE2]
+    water_cut = water_cut.loc[config.CUT_DATE:config.CUT_DATE2]
+    pressure = pressure.loc[config.CUT_DATE:config.CUT_DATE2]
+    injection = injection.loc[config.CUT_DATE:config.CUT_DATE2]
+
+    # делает переиндексацию на новые даты. Кажется, что можно без этой процедуры
+    ind = pd.date_range(start=production.index[0], end=production.index[-1], freq='D')
+    production = production.reindex(ind).\
+        apply(lambda x: x.interpolate(method='linear', limit_direction='forward', limit_area='inside'), axis=0)
+
+    pressure = pressure.reindex(ind).\
+        apply(lambda x: x.interpolate(method='linear', limit_direction='forward', limit_area='inside'), axis=0)
+
+    water_cut = water_cut.reindex(ind).\
+        apply(lambda x: x.interpolate(method='linear', limit_direction='forward', limit_area='inside'), axis=0)
+
+    injection = injection.reindex(ind).\
+        apply(lambda x: x.interpolate(method='linear', limit_direction='forward', limit_area='inside'), axis=0)
+
+    name_inj_wells = list(injection.columns)
+
+    prod_df_lst = [production, pressure, water_cut]
+    names_prod_wells = list(reduce(lambda x, y: x & set(y.columns), prod_df_lst[1:], set(prod_df_lst[0].columns)) # названия добывающих скважин
+                            - set(name_inj_wells))
+
+    for i, df in enumerate(prod_df_lst):
+        prod_df_lst[i] = df[names_prod_wells]
+
+        # в names_prod_wells нет и нагнетающих скважин,
+        # и скважин, которых нет хотя бы в одной их характеристик добывающих скважин.
+        # однако, непонятно, как информация о переводах вносится в приемистость.
+        # поэтому необходимо занулить приемистость "из прошлого".
+        # НЕ НУЖНО, ПОТОМУ ЧТО СЕЙЧАС наны в приемистости заполняются нулями и так. код с ошибками.
+        # injection[(set(df.columns) - set(names_prod_wells)) & set(name_inj_wells)] = 0
+
+    production, pressure, water_cut = prod_df_lst
+
+    logger.info('production_shape' + str(production.shape))
+    logger.info('pressure_shape' + str(pressure.shape))
+    logger.info('water_cut_shape' + str(water_cut.shape))
+    logger.info('injection_shape' + str(injection.shape))
+
+    # +++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+
+    # +++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+
+    path = config.path_train
+
+    coordinates = coordinates[~coordinates.index.duplicated(keep='first')]
+
+    # Матрицы, когда для дебита или приемистости есть соответствующее значение забойного давления (давления в линии)
+    prod = set(injection.columns.values)
+
+    # Скважины, которые простаивают большую часть времени необходимо исключить,
+    # так как они вносят лишнюю неопределенность.
+    active_prod_wells = cut_inactive_wells(production, thres=config.inactive_time)[0] # активные скважины
+    production = production.loc[:, active_prod_wells.columns]
+    pressure = pressure.loc[:, active_prod_wells.columns]
+    water_cut = water_cut.loc[:, active_prod_wells.columns]
+
+    prod = set(production.columns.values)
+    pres = set(pressure.columns.values)
+    list1 = list(pres & prod)
+    production = production.loc[:, list1]
+    pressure = pressure.loc[:, list1]
+
+    # Нагнетательные скважины, удаленные на большое расстояние от добывающих вносят незначительный вклад либо вовсе
+    # незначимы, поэтому для уменьшения размерности задачи их необходимо отбросить.
+    names_prod_wells = list(set(production.columns) & set(coordinates.index))
+    production = production[names_prod_wells]
+    pressure = pressure[names_prod_wells]
+    water_cut = water_cut[names_prod_wells]
+
+    names_inj_wells = list(set(injection.columns) & set(coordinates.index))
+    injection = injection[names_inj_wells]
+    injection = select_wells_nearest_to_prod(injection, production, coordinates, dist_thres=config.INFLUENCE_R, double_R=config.double_R)
+    ################################################
+    # Аквифер
+    if config.aquifer == True:
+        data_aquifer = pd.read_excel(os.path.join(config.path_train, f'aquifer_per_area_update.xlsx'))
+        data_aquifer.columns = data_aquifer.columns.astype(str)
+        for well in injection.columns:
+            if well in data_aquifer.columns:
+                injection[well] = injection[well] + data_aquifer[well]
+        injection = injection.fillna(0)
+    ################################################
+    # Для более точной аппроксимации значений дебитов при остановке и включении скважин, необходимо заполнить нулевые
+    # значения для давлений. Для этого нужно знать значение пластового давления и
+    # характерное время восстановления давления.
+    # d1 =set(production.columns.values).difference(set(pressure.columns.values))
+    # # print(set(production.columns.values))
+    # # print(pressure.info())
+    # # print(production.info())
+    rec_pressure = recover_pres(pressure, inplace=False, p_res=config.p_res, p_0=config.p_0,
+                                recov_time=config.recov_time) # заполняет значения в забойном давлении
+
+    is_work = production.astype(bool).astype(int)
+    is_halt = np.array(np.ones_like(is_work) - is_work, dtype=np.int64)
+
+    # # Оптимизация модели
+    # Для моделей CRM/CRMIP
+    # схема модели svir/lwir
+    SCHEME = config.SCHEME
+    # начальное значение параметров модели
+    TAU_0 = config.TAU_0
+    J_0 = config.J_0
+    # радиус влияния (вне его скважины считаются невзаимодействующими)
+    INFLUENCE_R = config.INFLUENCE_R
+    double_R = config.double_R
+
+    # Параметры оптимизации SLSQP
+    options = config.options_SLSQP_CRM
+
+    # ### CRM, CRMIP
+    # Ограничения на оптимизируемые параметры
+    # границы для параметров для CRM/CRMIP
+    bnds = config.bnds_CRM
+    # ---------------------------------------------------------------------------
+
+    minimizer = SciPySlsqpWrapper(options, verbose=config.display_graphs)
+
+    # Выбор модели
+
+    # !!!! Расчет модели. Может занять много времени.
+    # Можно не запускать, если есть сохраненная модель в файле crm.pickle
+    save_path = config.save_path_train
+
+    if not os.path.exists(save_path):
+        os.makedirs(save_path)
+
+    tmp_dict = {
+        'prod_wells': {},
+        'inj_wells': {}
+    }
+
+    for (well_name, inj) in injection.items():
+        tmp_dict['inj_wells'][well_name] = {'injection': inj[-1]}
+
+    for (well_name, press) in pressure.items():
+        tmp_dict['prod_wells'][well_name] = {'pressure': press[-1]}
+
+    for (well_name, prod) in production.items():
+        tmp_dict['prod_wells'][well_name]['production'] = prod[-1]
+
+    # построение модели CRM
+    model_CRM = CRM(coordinates, bnds, production.columns, injection.columns,
+                scheme=SCHEME, tau_0=TAU_0, J_0=J_0, influence_r=INFLUENCE_R, double_r=double_R)
+    # обучение модели
+    model_CRM.fit(production.values, is_halt, injection.values, rec_pressure.values, minimizer)
+    real_f = model_CRM.f.copy() # коэффициент взаимовлияния
+    inj_wells_f = np.sum(model_CRM.f, axis=1)
+
+    tmp_ndarray = np.zeros_like(model_CRM.f)
+    for i, well in enumerate(model_CRM.inj_n):
+        tmp_ndarray[i, :] = model_CRM.f[i, :] if inj_wells_f[i] <= 1 else model_CRM.f[i, :]/inj_wells_f[i]
+
+    model_CRM.f = tmp_ndarray
+    model_CRM.to_excel(os.path.join(save_path, 'CRM.xlsx'))
+
+    model_CRM.f = real_f.copy()
+    concated_df, f_dict = plot.crm_map(pd.DataFrame(model_CRM.f, index=model_CRM.inj_n, columns=model_CRM.prod_n),
+                                       coordinates[['Координата X', 'Координата Y']].reset_index(), save_path, 'CRM',
+                                       border=config.border)
+    plot.crm_plot(concated_df, f_dict, os.path.join(save_path, 'CRM_map')) # строит карты взаимовлияния CRM
+
+        # pickle.dump((tmp_dict, model_CRM), f)
+
+    # Визуализация для CRM
+
+    pred = model_CRM.predict(model_CRM.prod_0, is_halt, injection.values, rec_pressure.values)
+
+    pred_CRM_df = pd.DataFrame(data=pred, index=injection.index, columns=production.columns)
+
+    # writer = pd.ExcelWriter(os.path.join(save_path, 'CRM_prediction.xlsx'))
+    # pred_CRM_df.to_excel(writer, 'Sheet1')
+    # writer.save()
+
+    # # построение модели CRMIP
+    # model_CRMIP = CRMIP(coordinates, bnds, production.columns, injection.columns,
+    #               scheme='SVIR', tau_0=TAU_0, J_0=J_0, influence_r=INFLUENCE_R, double_r=double_R)
+    #
+    # model_CRMIP.fit(production.values, is_halt, injection.values, rec_pressure.values, minimizer)
+    # real_f = model_CRMIP.f.copy()
+    # inj_wells_f = np.sum(model_CRMIP.f, axis=1)
+    #
+    # tmp_ndarray = np.zeros_like(model_CRMIP.f)
+    # for i, well in enumerate(model_CRMIP.inj_n):
+    #     tmp_ndarray[i, :] = model_CRMIP.f[i, :] if inj_wells_f[i] <= 1 else model_CRMIP.f[i, :] / inj_wells_f[i]
+    #
+    # model_CRMIP.f = tmp_ndarray
+    # model_CRMIP.to_excel(os.path.join(save_path, 'CRMIP.xlsx'))
+    #
+    # recounted_inj(inj_wells_f, model_CRM.inj_n).to_excel(os.path.join(save_path, 'recounted_injection_CRMIP.xlsx'))
+    #
+    # model_CRMIP.f = real_f.copy()
+    #
+    # concated_df, f_dict = plot.crm_map(pd.DataFrame(model_CRMIP.f, index=model_CRMIP.inj_n, columns=model_CRMIP.prod_n),
+    #                                    coordinates.reset_index(), save_path, 'CRMIP',
+    #                                    border=config.border)
+    # plot.crm_plot(concated_df, f_dict,  os.path.join(save_path, 'CRMIP')) # строит карты взаимовлияния CRMIP
+    #
+    # # Визуализация для CRMIP
+    # pred = model_CRMIP.predict(model_CRMIP.prod_0, is_halt, injection.values, rec_pressure.values)
+    # pred_CRMIP_df = pd.DataFrame(data=pred, index=injection.index, columns=production.columns)
+    #
+
+    # writer = pd.ExcelWriter(os.path.join(save_path, 'CRMIP_prediction.xlsx'))
+    # pred_CRMIP_df.to_excel(writer, 'Sheet1')
+    # writer.save()
+
+    # if config.liquid_flag or config.wc_flag or config.gaz_factor_flag or config.pressure_reservoir_flag:
+    #     injection_sum = pdInj.prepare_file_with_injection(model_CRMIP.f,
+    #                                                       model_CRMIP.inj_n, model_CRMIP.prod_n,
+    #                                                       injection,
+    #                                                       config.CUT_DATE, config.CUT_DATE2).loc[:, production.columns]
+    # else:
+    #     injection_sum = pd.DataFrame([])
+    injection_sum = pd.DataFrame([])
+    # TODO rename
+    # columns = [pred_CRM_df, pred_CRMIP_df, pressure, injection_sum]
+    columns = [pred_CRM_df, pressure, injection_sum] # pred_CRMIP_df
+    name_column_tuples = [(production, 'liquid'), (water_cut, 'wc')]
+
+    df_to_save = [('pressure', pressure), ('injection_sum', injection_sum), ('production', production),
+                  ('water_cut', water_cut),
+                  ('injection', injection),
+                  ('rec_pressure', rec_pressure)]
+
+    # for name, df in df_to_save:
+    #     df.to_excel(os.path.join(save_path, name+'.xlsx'))
+
+    # Service
+    tmp_past_set = None
+    info = get_info(injection, rec_pressure, tmp_past_set)
+
+    logger.success("Train is finished")
+
+    # PREDICTION
+
+    PREDICTION_DATE = info['restart_date']
+    PREDICTION_DATE2 = datetime.strftime(
+                datetime.strptime(PREDICTION_DATE, '%Y-%m-%d') + timedelta(config.delta), '%Y-%m-%d')
+    date_range = pd.date_range(start=PREDICTION_DATE, end=PREDICTION_DATE2)
+
+    logger.info(PREDICTION_DATE, PREDICTION_DATE2)
+    # для прогноза давление и приемистость
+    tmp_pressure = pd.\
+        pivot_table(nef_info, values='Забойное давление', index='Дата', columns='Скважина', dropna=False).\
+        apply(lambda x: x.interpolate(limit_direction='forward', limit_area='inside'), axis=0)[PREDICTION_DATE:PREDICTION_DATE2]. \
+        dropna(axis=1, how='all').fillna(0) # заполняет пропуски дат в данных забойного давления
+    tmp_pressure.columns.name = None
+    tmp_injection = pd.\
+        pivot_table(nag_info, values='Приемистость', index='Дата', columns='Скважина', dropna=False).\
+        apply(lambda x: x.interpolate(limit_direction='forward', limit_area='inside'), axis=0)[PREDICTION_DATE:PREDICTION_DATE2]. \
+        dropna(axis=1, how='all').fillna(0) # заполняет пропуски дат в данных приемистости
+    tmp_injection.columns.name = None
+
+    tmp_pressure.columns = tmp_pressure.columns.astype(str)
+    tmp_pressure.index = pd.to_datetime(tmp_pressure.index)
+    tmp_injection.columns = tmp_injection.columns.astype(str)
+    tmp_injection.index = pd.to_datetime(tmp_injection.index)
+    # tmp_pressure.columns = tmp_pressure.columns[tmp_pressure.columns.isin(model_CRM.prod_n)]
+    # tmp_injection.columns = tmp_injection.columns[tmp_injection.columns.isin(model_CRM.inj_n)]
+
+    empty_df = pd.DataFrame([], index=date_range)
+    # tmp_pressure = pd.DataFrame(columns=model_CRM.prod_n, index=date_range)
+    # tmp_injection = pd.DataFrame(columns=model_CRM.inj_n, index=date_range)
+    # tmp_pressure = tmp_pressure[PREDICTION_DATE:PREDICTION_DATE2]
+    # tmp_injection = tmp_injection[PREDICTION_DATE:PREDICTION_DATE2]
+
+    crm_wells_dict, CRM_model = tmp_dict, model_CRM
+    # CRMIP_model = model_CRMIP
+
+    inj_wells_names_CRM = list(crm_wells_dict['inj_wells'].keys())
+    prod_wells_names_CRM = list(crm_wells_dict['prod_wells'].keys())
+
+    # add uncontrollable wells
+    tmp_dict = {}
+    for well_name in set(inj_wells_names_CRM) - set(tmp_injection.columns):
+        tmp_dict[well_name] = [crm_wells_dict['inj_wells'][well_name]['injection']] * len(tmp_injection.index)
+    injection = pd.concat([tmp_injection, pd.DataFrame(data=tmp_dict, index=date_range)], axis=1)
+
+    tmp_dict = {}
+    for well_name in set(prod_wells_names_CRM) - set(tmp_pressure.columns):
+        tmp_dict[well_name] = [crm_wells_dict['prod_wells'][well_name]['pressure']] * len(tmp_pressure.index)
+    pressure = pd.concat([tmp_pressure, pd.DataFrame(data=tmp_dict, index=date_range)], axis=1)
+
+    tmp_dict = {}
+    for well_name in prod_wells_names_CRM:
+        tmp_dict[well_name] = [crm_wells_dict['prod_wells'][well_name]['production']]
+    production = pd.DataFrame(data=tmp_dict, index=date_range)
+
+    # set wells in the right order
+    injection = injection.loc[:, inj_wells_names_CRM]
+    pressure = pressure.loc[:, prod_wells_names_CRM]
+
+    # Для более точной аппроксимации значений дебитов при остановке и включении скважин, необходимо заполнить нулевые
+    # значения для давлений. Для этого нужно знать значение пластового давления и характерное время восстановления
+    # давления.
+    recover_pressure_params = (config.p_res, config.p_0, config.recov_time)
+    rec_pressure = recover_pres(pressure, False, *recover_pressure_params)
+
+    # if save_outputs:
+    #     injection.to_excel(os.path.join(save_path, 'injection_result.xlsx'))
+    #     pressure.to_excel(os.path.join(save_path, 'pressure_result.xlsx'))
+    #     rec_pressure.to_excel(os.path.join(save_path, 'rec_pressure_result.xlsx'))
+    # TODO подумать
+    # is_work = pressure.astype(bool).astype(int)
+    # is_halt = np.array(np.ones_like(is_work) - is_work, dtype=np.int64)
+    is_halt = np.zeros(rec_pressure.shape, dtype=np.int64)
+
+    # CRM
+    prod_0 = CRM_model.pl.split(CRM_model._initial_guess(production.values))[0]
+    pred_CRM = CRM_model.predict(prod_0, is_halt, injection.values, rec_pressure.values)
+    pred_CRM = pd.DataFrame(data=pred_CRM, index=injection.index, columns=pressure.columns)
+
+
+    # with pd.ExcelWriter(
+    #     os.path.join(save_path, "CRM_prediction.xlsx")
+    # ) as writer:
+    #     # pred_CRM_df.to_excel(writer, "Train")
+    #     pred_CRM.to_excel(writer, "Predict")
+
+    # save table for statistic
+    crm_fact = pd.pivot_table(nef_info, values='Дебит жидкости',
+                              index='Дата', columns='Скважина',
+                              dropna=False)[PREDICTION_DATE:PREDICTION_DATE2]
+    data_stat = pd.DataFrame(index=pred_CRM.index)
+    for well in pred_CRM.columns:
+        data_stat[f'{well}_liq_true'] = crm_fact[well]
+        data_stat[f'{well}_liq_pred'] = pred_CRM[well]
+        data_stat[f'{well}_oil_true'] = np.NaN
+        data_stat[f'{well}_oil_pred'] = np.NaN
+    data_stat.to_excel(os.path.join(save_path, 'CRM_res.xlsx'))
+    # calculate error
+    error = pd.DataFrame(columns=pred_CRM.columns, index=pred_CRM.index)
+    for well in error.columns:
+        error[well] = abs(data_stat[f'{well}_liq_true'] - data_stat[f'{well}_liq_pred']) / data_stat[f'{well}_liq_true']
+    error = error * 100
+    error[error>100] = 100
+    logger.info(f'Prediction error: {error.mean().mean()} %')
+    # # CRMIP
+    # prod_0 = CRMIP_model.rsc.convert(CRMIP_model.pl.split(CRMIP_model._initial_guess(production.values))[0])
+    # pred_CRMIP = CRMIP_model.predict(prod_0, is_halt, injection.values, rec_pressure.values)
+    # pred_CRMIP = pd.DataFrame(data=pred_CRMIP, index=injection.index, columns=pressure.columns)
+    # writer = pd.ExcelWriter(
+    #     os.path.join(save_path, "Результаты обучения и прогноза CRMIP.xlsx")
+    # )
+    # # pred_CRMIP_df.to_excel(writer, "Train")
+    # pred_CRMIP.to_excel(writer, "Predict")
+    # writer.save()
+
+    logger.success("Prediction is finished")
+
+if __name__ == '__main__':
+    main()
